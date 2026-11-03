@@ -19,6 +19,23 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
+// Polyfills for PHP < 8.0 compatibility
+if ( ! function_exists( 'str_contains' ) ) {
+	function str_contains( string $haystack, string $needle ): bool {
+		return '' === $needle || false !== strpos( $haystack, $needle );
+	}
+}
+if ( ! function_exists( 'str_starts_with' ) ) {
+	function str_starts_with( string $haystack, string $needle ): bool {
+		return '' === $needle || 0 === strncmp( $haystack, $needle, strlen( $needle ) );
+	}
+}
+if ( ! function_exists( 'str_ends_with' ) ) {
+	function str_ends_with( string $haystack, string $needle ): bool {
+		return '' === $needle || substr( $haystack, -strlen( $needle ) ) === $needle;
+	}
+}
+
 // Plugin constants
 define( 'KSTNEWS_AI_VERSION', '1.0.0' );
 define( 'KSTNEWS_AI_PLUGIN_DIR', plugin_dir_path( __FILE__ ) );
@@ -101,25 +118,29 @@ class KSTNews_AI_Autopilot {
 	 * Plugin activation routine.
 	 */
 	public static function activate(): void {
-		// Create log table
-		self::create_tables();
+		try {
+			// Create log table
+			self::create_tables();
 
-		// Initialize settings if empty
-		if ( false === get_option( KSTNews_AI_Settings::OPTION_KEY ) ) {
-			add_option( KSTNews_AI_Settings::OPTION_KEY, KSTNews_AI_Settings::get_defaults() );
-		}
-
-		// Initialize state if empty
-		if ( false === get_option( KSTNews_AI_Settings::STATE_KEY ) ) {
-			add_option( KSTNews_AI_Settings::STATE_KEY, KSTNews_AI_Settings::get_default_state() );
-		}
-
-		// Schedule cron if enabled
-		$settings = KSTNews_AI_Settings::get_all();
-		if ( ! empty( $settings['auto_cron'] ) ) {
-			if ( class_exists( 'KSTNews_AI_Cron' ) ) {
-				KSTNews_AI_Cron::reschedule();
+			// Initialize settings if empty
+			if ( false === get_option( KSTNews_AI_Settings::OPTION_KEY ) ) {
+				add_option( KSTNews_AI_Settings::OPTION_KEY, KSTNews_AI_Settings::get_defaults() );
 			}
+
+			// Initialize state if empty
+			if ( false === get_option( KSTNews_AI_Settings::STATE_KEY ) ) {
+				add_option( KSTNews_AI_Settings::STATE_KEY, KSTNews_AI_Settings::get_default_state() );
+			}
+
+			// Schedule cron if enabled
+			$settings = KSTNews_AI_Settings::get_all();
+			if ( ! empty( $settings['auto_cron'] ) ) {
+				if ( class_exists( 'KSTNews_AI_Cron' ) ) {
+					KSTNews_AI_Cron::reschedule();
+				}
+			}
+		} catch ( \Throwable $t ) {
+			wp_die( 'Plugin activation error: ' . esc_html( $t->getMessage() ) );
 		}
 	}
 
@@ -134,7 +155,7 @@ class KSTNews_AI_Autopilot {
 
 		$sql = "CREATE TABLE {$table_name} (
 			id bigint(20) unsigned NOT NULL AUTO_INCREMENT,
-			created_at datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			created_at datetime NOT NULL,
 			channel varchar(100) NOT NULL DEFAULT '',
 			message_id bigint(20) unsigned NOT NULL DEFAULT 0,
 			status varchar(50) NOT NULL DEFAULT '',

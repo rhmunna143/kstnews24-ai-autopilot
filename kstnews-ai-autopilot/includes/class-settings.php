@@ -106,7 +106,7 @@ class KSTNews_AI_Settings {
 	 * @param mixed  $default
 	 * @return mixed
 	 */
-	public static function get( string $key, mixed $default = null ): mixed {
+	public static function get( string $key, $default = null ) {
 		$all = self::get_all();
 		if ( array_key_exists( $key, $all ) ) {
 			return $all[ $key ];

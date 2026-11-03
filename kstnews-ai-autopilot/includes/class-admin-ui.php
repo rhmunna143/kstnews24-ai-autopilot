@@ -664,14 +664,24 @@ class KSTNews_AI_Admin_UI {
 							<?php else : ?>
 								<?php foreach ( $logs as $item ) : ?>
 									<?php
-									$badge_class = match ( $item['status'] ) {
-										KSTNews_AI_Logger::STATUS_PUBLISHED        => 'kstnews-badge-published',
-										KSTNews_AI_Logger::STATUS_DRAFT            => 'kstnews-badge-draft',
-										KSTNews_AI_Logger::STATUS_BLOCKED_PREFILTER => 'kstnews-badge-blocked-prefilter',
-										KSTNews_AI_Logger::STATUS_BLOCKED_AI       => 'kstnews-badge-blocked-ai',
-										KSTNews_AI_Logger::STATUS_SKIPPED_DUPLICATE => 'kstnews-badge-skipped',
-										default                                    => 'kstnews-badge-error',
-									};
+									$badge_class = 'kstnews-badge-error';
+									switch ( $item['status'] ) {
+										case KSTNews_AI_Logger::STATUS_PUBLISHED:
+											$badge_class = 'kstnews-badge-published';
+											break;
+										case KSTNews_AI_Logger::STATUS_DRAFT:
+											$badge_class = 'kstnews-badge-draft';
+											break;
+										case KSTNews_AI_Logger::STATUS_BLOCKED_PREFILTER:
+											$badge_class = 'kstnews-badge-blocked-prefilter';
+											break;
+										case KSTNews_AI_Logger::STATUS_BLOCKED_AI:
+											$badge_class = 'kstnews-badge-blocked-ai';
+											break;
+										case KSTNews_AI_Logger::STATUS_SKIPPED_DUPLICATE:
+											$badge_class = 'kstnews-badge-skipped';
+											break;
+									}
 									?>
 									<tr>
 										<td>#<?php echo (int) $item['id']; ?></td>

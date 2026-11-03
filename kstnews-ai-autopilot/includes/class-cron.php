@@ -77,7 +77,7 @@ class KSTNews_AI_Cron {
 	 *
 	 * @return int|false
 	 */
-	public static function get_next_run(): int|false {
+	public static function get_next_run() {
 		return wp_next_scheduled( self::HOOK );
 	}
 

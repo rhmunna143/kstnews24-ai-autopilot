@@ -130,12 +130,18 @@ class KSTNews_AI_Image_Processor {
 		}
 
 		// Load source image resource
-		$src = match ( $type ) {
-			IMAGETYPE_JPEG => @imagecreatefromjpeg( $src_path ),
-			IMAGETYPE_PNG  => @imagecreatefrompng( $src_path ),
-			IMAGETYPE_WEBP => function_exists( 'imagecreatefromwebp' ) ? @imagecreatefromwebp( $src_path ) : null,
-			default        => null,
-		};
+		$src = null;
+		switch ( $type ) {
+			case IMAGETYPE_JPEG:
+				$src = @imagecreatefromjpeg( $src_path );
+				break;
+			case IMAGETYPE_PNG:
+				$src = @imagecreatefrompng( $src_path );
+				break;
+			case IMAGETYPE_WEBP:
+				$src = function_exists( 'imagecreatefromwebp' ) ? @imagecreatefromwebp( $src_path ) : null;
+				break;
+		}
 
 		if ( ! $src ) {
 			return null;
