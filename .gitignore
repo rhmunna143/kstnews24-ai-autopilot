@@ -1,0 +1,21 @@
+# Operating System files
+Thumbs.db
+.DS_Store
+desktop.ini
+
+# IDE & Editor files
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# Testing & Temporary
+/tests/output/
+/tests/temp/
+*.log
+
+# Built zip packages (if kept in root or gitignored)
+# We may keep kstnews-ai-autopilot.zip or allow committing it depending on repo needs.
