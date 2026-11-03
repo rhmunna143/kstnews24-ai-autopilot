@@ -147,7 +147,9 @@ class KSTNews_AI_Autopilot {
 			KEY created_at (created_at)
 		) {$charset_collate};";
 
-		require_once ABSPATH . 'wp-admin/includes/upgrade.php';
+		if ( ! function_exists( 'dbDelta' ) ) {
+			require_once ABSPATH . 'wp-admin/includes/upgrade.php';
+		}
 		dbDelta( $sql );
 	}
 
