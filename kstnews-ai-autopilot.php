@@ -18,19 +18,23 @@ class KSTNews_AI_AutoPilot {
     private string $state_key  = 'kstnews_ai_last_msg_id';
 
     private array $defaults = [
-        'or_api_key'  => '',
-        'or_model'    => 'nvidia/nemotron-3.5-super-vl:free',
-        'tg_channel'  => 'basherkella',
-        'post_status' => 'draft',
-        'auto_cron'   => 1,
+        'or_api_key'   => '',
+        'or_model'     => 'nvidia/nemotron-3.5-super-vl:free',
+        'tg_channel'   => 'basherkella',
+        'post_status'  => 'draft',
+        'auto_cron'    => 1,
+        'daily_limit'  => 150,
+        'author_name'  => 'ওপেন সোর্স প্রতিনিধি',
     ];
 
     public function __construct() {
         add_action('admin_menu', [$this, 'register_admin_menu']);
         add_action('admin_init', [$this, 'handle_form_actions']);
         add_action('init', [$this, 'ensure_cron_scheduled']);
+        add_action('init', [$this, 'handle_worker_request']);
+        add_action('init', [$this, 'heartbeat_cron_check']);
         add_filter('cron_schedules', [$this, 'add_cron_interval']);
-        add_action('kstnews_ai_cron_hook', [$this, 'run_pipeline']);
+        add_action('kstnews_ai_cron_hook', [$this, 'run_cron_job']);
 
         // Completely disable internal self-pingbacks and pingback comments
         add_action('pre_ping', [$this, 'disable_self_pingbacks']);
@@ -38,6 +42,120 @@ class KSTNews_AI_AutoPilot {
 
         add_action('wp_ajax_kst_run_pipeline_ajax', [$this, 'ajax_run_pipeline']);
         add_action('wp_ajax_kst_test_api_ajax', [$this, 'ajax_test_api']);
+    }
+
+    public function run_cron_job(): void {
+        $this->run_pipeline(false);
+    }
+
+    public function handle_worker_request(): void {
+        if (isset($_GET['kstnews_auto_worker'])) {
+            // Bypass page caching plugins (LiteSpeed Cache, Cloudflare, etc.)
+            nocache_headers();
+            if (function_exists('set_time_limit')) {
+                @set_time_limit(180);
+            }
+            $result = $this->run_pipeline(false);
+            delete_transient('kstnews_ai_cron_lock');
+            header('Content-Type: application/json; charset=utf-8');
+            echo wp_json_encode($result);
+            exit;
+        }
+    }
+
+    public function heartbeat_cron_check(): void {
+        $settings = $this->get_settings();
+        if (empty($settings['auto_cron'])) {
+            return;
+        }
+
+        if (wp_doing_ajax() || wp_doing_cron() || isset($_GET['kstnews_auto_worker'])) {
+            return;
+        }
+
+        $last_run = (int) get_option('kstnews_ai_last_cron_run', 0);
+        // If 10 minutes (600s) have passed since last automated run
+        if ((time() - $last_run) >= 600) {
+            if (!get_transient('kstnews_ai_cron_lock')) {
+                set_transient('kstnews_ai_cron_lock', 1, 180);
+                
+                // Spawn async non-blocking execution to worker endpoint
+                $url = add_query_arg('kstnews_auto_worker', '1', home_url('/'));
+                wp_remote_get($url, [
+                    'timeout'   => 2,
+                    'blocking'  => false,
+                    'sslverify' => false,
+                ]);
+            }
+        }
+    }
+
+    public function get_24h_post_count(): int {
+        $history = get_option('kstnews_ai_24h_history', []);
+        if (!is_array($history)) {
+            $history = [];
+        }
+        $cutoff = time() - 86400; // 24 hours ago
+        $active = array_values(array_filter($history, fn($t) => is_numeric($t) && (int) $t > $cutoff));
+        if (count($active) !== count($history)) {
+            update_option('kstnews_ai_24h_history', $active);
+        }
+        return count($active);
+    }
+
+    private function record_published_post_timestamp(): void {
+        $history = get_option('kstnews_ai_24h_history', []);
+        if (!is_array($history)) {
+            $history = [];
+        }
+        $history[] = time();
+        $cutoff    = time() - 86400;
+        $history   = array_values(array_filter($history, fn($t) => is_numeric($t) && (int) $t > $cutoff));
+        update_option('kstnews_ai_24h_history', $history);
+    }
+
+    public function get_or_create_ai_author_id(string $name = 'ওপেন সোর্স প্রতিনিধি'): int {
+        $name = trim($name) ?: 'ওপেন সোর্স প্রতিনিধি';
+
+        // 1. Check if user exists by dedicated login
+        $user = get_user_by('login', 'opensource_reporter');
+        if ($user) {
+            if ($user->display_name !== $name) {
+                wp_update_user([
+                    'ID'           => $user->ID,
+                    'display_name' => $name,
+                    'nickname'     => $name,
+                ]);
+            }
+            return (int) $user->ID;
+        }
+
+        // 2. Search existing users by display name or login directly
+        $all_users = get_users(['number' => 100]);
+        foreach ($all_users as $u) {
+            if (trim($u->display_name) === $name || trim($u->user_login) === $name) {
+                return (int) $u->ID;
+            }
+        }
+
+        // 3. Create dedicated author user
+        $host = wp_parse_url(home_url(), PHP_URL_HOST) ?: 'kstnews24.com';
+        $user_id = wp_insert_user([
+            'user_login'   => 'opensource_reporter',
+            'display_name' => $name,
+            'nickname'     => $name,
+            'first_name'   => 'ওপেন সোর্স',
+            'last_name'    => 'প্রতিনিধি',
+            'user_pass'    => wp_generate_password(24, true, true),
+            'user_email'   => 'opensource@' . $host,
+            'role'         => 'author',
+        ]);
+
+        if (!is_wp_error($user_id)) {
+            return (int) $user_id;
+        }
+
+        return get_current_user_id() ?: 1;
     }
 
     public function disable_self_pingbacks(&$links): void {
@@ -141,11 +259,13 @@ class KSTNews_AI_AutoPilot {
 
         if (isset($_POST['kst_save_settings']) && check_admin_referer('kst_ai_nonce')) {
             $settings = [
-                'or_api_key'  => sanitize_text_field($_POST['or_api_key'] ?? ''),
-                'or_model'    => sanitize_text_field($_POST['or_model'] ?? 'nvidia/nemotron-3.5-super-vl:free'),
-                'tg_channel'  => sanitize_text_field($_POST['tg_channel'] ?? 'basherkella'),
-                'post_status' => sanitize_text_field($_POST['post_status'] ?? 'draft'),
-                'auto_cron'   => isset($_POST['auto_cron']) ? 1 : 0,
+                'or_api_key'   => sanitize_text_field($_POST['or_api_key'] ?? ''),
+                'or_model'     => sanitize_text_field($_POST['or_model'] ?? 'nvidia/nemotron-3.5-super-vl:free'),
+                'tg_channel'   => sanitize_text_field($_POST['tg_channel'] ?? 'basherkella'),
+                'post_status'  => sanitize_text_field($_POST['post_status'] ?? 'draft'),
+                'auto_cron'    => isset($_POST['auto_cron']) ? 1 : 0,
+                'daily_limit'  => max(1, absint($_POST['daily_limit'] ?? 150)),
+                'author_name'  => sanitize_text_field($_POST['author_name'] ?? 'ওপেন সোর্স প্রতিনিধি'),
             ];
             update_option($this->option_key, $settings);
 
@@ -231,13 +351,38 @@ class KSTNews_AI_AutoPilot {
     }
 
     public function run_pipeline(bool $is_manual = false): array {
+        // Prevent concurrent overlapping runs
+        if (!$is_manual) {
+            if (get_transient('kstnews_ai_pipeline_lock')) {
+                return ['status' => 'locked', 'message' => 'Pipeline is already running in another process.'];
+            }
+            set_transient('kstnews_ai_pipeline_lock', 1, 180);
+        }
+
+        update_option('kstnews_ai_last_cron_run', time());
+
         $settings = $this->get_settings();
         $api_key  = trim($settings['or_api_key']);
         $model    = trim($settings['or_model']);
         $channel  = trim($settings['tg_channel'], '@/ ');
         $status   = $settings['post_status'];
 
+        // Enforce daily post limit (default: 150 posts in rolling 24-hour window)
+        $daily_limit = (int) ($settings['daily_limit'] ?? 150);
+        $count_24h   = $this->get_24h_post_count();
+        if ($count_24h >= $daily_limit) {
+            if (!$is_manual) {
+                delete_transient('kstnews_ai_pipeline_lock');
+            }
+            $limit_msg = "Daily post limit of {$daily_limit} posts reached ({$count_24h} published in last 24h). Autopilot paused.";
+            return [
+                'status'  => 'limit_reached',
+                'message' => $limit_msg,
+            ];
+        }
+
         if (empty($api_key)) {
+            if (!$is_manual) delete_transient('kstnews_ai_pipeline_lock');
             return ['status' => 'error', 'message' => 'OpenRouter API Key is missing.'];
         }
 
@@ -248,6 +393,7 @@ class KSTNews_AI_AutoPilot {
         ]);
 
         if (is_wp_error($response)) {
+            if (!$is_manual) delete_transient('kstnews_ai_pipeline_lock');
             return ['status' => 'error', 'message' => 'Telegram connection error: ' . $response->get_error_message()];
         }
 
@@ -255,6 +401,7 @@ class KSTNews_AI_AutoPilot {
         $posts = $this->parse_telegram_html($html);
 
         if (empty($posts)) {
+            if (!$is_manual) delete_transient('kstnews_ai_pipeline_lock');
             return ['status' => 'error', 'message' => 'No public posts found on t.me/s/' . esc_html($channel)];
         }
 
@@ -284,6 +431,7 @@ class KSTNews_AI_AutoPilot {
         if (empty($candidates)) {
             $latest_channel_id = end($posts)['id'] ?? $last_id;
             update_option($this->state_key, max($last_id, $latest_channel_id));
+            if (!$is_manual) delete_transient('kstnews_ai_pipeline_lock');
             return [
                 'status'  => 'info',
                 'message' => "All recent Telegram posts on @{$channel} have already been published in WordPress! Waiting for new channel updates (Latest: #{$latest_channel_id}).",
@@ -298,12 +446,14 @@ class KSTNews_AI_AutoPilot {
         if (mb_strlen($tg_post['text']) < 15) {
             $this->add_log($msg_id, 'Skipped', 'Text too short for news article.');
             update_option($this->state_key, max($last_id, $msg_id));
+            if (!$is_manual) delete_transient('kstnews_ai_pipeline_lock');
             return ['status' => 'skipped', 'message' => "Post #{$msg_id} was skipped (text too short)."];
         }
 
         if ($this->is_spam_or_ad($tg_post['text'])) {
             $this->add_log($msg_id, 'Blocked Ad', 'Matched promo/spam keyword filter.');
             update_option($this->state_key, max($last_id, $msg_id));
+            if (!$is_manual) delete_transient('kstnews_ai_pipeline_lock');
             return ['status' => 'blocked', 'message' => "Post #{$msg_id} was blocked as an advertisement."];
         }
 
@@ -311,6 +461,7 @@ class KSTNews_AI_AutoPilot {
         if (!$news || isset($news['error'])) {
             $err = $news['error'] ?? 'Invalid AI response';
             $this->add_log($msg_id, 'AI Error', $err);
+            if (!$is_manual) delete_transient('kstnews_ai_pipeline_lock');
             return ['status' => 'error', 'message' => "AI Error on #{$msg_id}: " . $err];
         }
 
@@ -318,6 +469,7 @@ class KSTNews_AI_AutoPilot {
             $reason = $news['skipReason'] ?? 'Non-news or AdSense policy violation';
             $this->add_log($msg_id, 'Rejected by AI', $reason);
             update_option($this->state_key, max($last_id, $msg_id));
+            if (!$is_manual) delete_transient('kstnews_ai_pipeline_lock');
             return ['status' => 'rejected', 'message' => "Post #{$msg_id} rejected by AI: " . $reason];
         }
 
@@ -367,11 +519,33 @@ class KSTNews_AI_AutoPilot {
             $content .= $related_html;
         }
 
-        $tags = $news['tags'] ?? ['kstnews24'];
-        if (!in_array('kstnews24', $tags, true)) {
-            $tags[] = 'kstnews24';
+        // Clean, validate, and ensure 5-8 rich SEO tags
+        $raw_tags = is_array($news['tags'] ?? null) ? $news['tags'] : [];
+        $cleaned_tags = [];
+        foreach ($raw_tags as $t) {
+            $t = trim(strip_tags((string) $t));
+            $t = ltrim($t, '#');
+            if ($t !== '' && mb_strlen($t) >= 2 && mb_strlen($t) <= 60) {
+                $cleaned_tags[] = $t;
+            }
         }
+
+        // Fallback: if AI provided fewer than 3 tags, augment with categories
+        if (count($cleaned_tags) < 3 && !empty($news['categories'])) {
+            foreach ((array) $news['categories'] as $cat) {
+                $cleaned_tags[] = trim($cat);
+            }
+        }
+
+        if (!in_array('kstnews24', $cleaned_tags, true)) {
+            $cleaned_tags[] = 'kstnews24';
+        }
+        $tags = array_values(array_unique($cleaned_tags));
+
         $content .= '<hr/><p><strong>ট্যাগসমূহ:</strong><br/>' . esc_html(implode(', ', $tags)) . '</p>';
+
+        $author_name = !empty($settings['author_name']) ? $settings['author_name'] : 'ওপেন সোর্স প্রতিনিধি';
+        $author_id   = $this->get_or_create_ai_author_id($author_name);
 
         $post_id = wp_insert_post([
             'post_title'     => wp_strip_all_tags($news['title']),
@@ -379,6 +553,7 @@ class KSTNews_AI_AutoPilot {
             'post_excerpt'   => sanitize_text_field($news['metaDescription'] ?? ''),
             'post_content'   => $content,
             'post_status'    => $status,
+            'post_author'    => $author_id,
             'post_category'  => $cat_ids,
             'tags_input'     => $tags,
             'ping_status'    => 'closed',
@@ -386,12 +561,16 @@ class KSTNews_AI_AutoPilot {
         ]);
 
         if ($post_id && !is_wp_error($post_id)) {
+            // Explicitly assign tags using wp_set_post_tags to bypass unauthenticated cron context permissions
+            wp_set_post_tags($post_id, $tags, false);
+
             if ($featured_id) {
                 set_post_thumbnail($post_id, $featured_id);
             }
 
             update_post_meta($post_id, '_kst_telegram_msg_id', $msg_id);
             update_option($this->state_key, max($last_id, $msg_id));
+            $this->record_published_post_timestamp();
 
             $permalink = get_permalink($post_id);
             $this->add_log($msg_id, 'Published', '<a href="' . esc_url($permalink) . '" target="_blank">' . esc_html($news['title']) . '</a>');
@@ -401,6 +580,10 @@ class KSTNews_AI_AutoPilot {
                 'link'  => $permalink,
                 'msg'   => $msg_id,
             ];
+        }
+
+        if (!$is_manual) {
+            delete_transient('kstnews_ai_pipeline_lock');
         }
 
         return [
@@ -546,7 +729,8 @@ class KSTNews_AI_AutoPilot {
             . "2. The raw post may contain anti-censorship apostrophes (e.g. আ'গুন, দু'র্বৃ'ত্তরা). Normalize these words into correct standard Bengali (e.g. আগুন, দুর্বৃত্তরা).\n"
             . "3. If the post is an advertisement, promotion, betting/gambling link, or spam: set isGenuineNews to false and provide skipReason.\n"
             . "4. If the post contains graphic blood, dead bodies, or severe hate speech violating Google AdSense policies: set isAdSenseSafe to false and provide skipReason.\n"
-            . "5. Otherwise, set isGenuineNews to true, isAdSenseSafe to true, and generate the full news article.\n\n"
+            . "5. Otherwise, set isGenuineNews to true, isAdSenseSafe to true, and generate the full news article.\n"
+            . "6. TAGS REQUIREMENT: Generate 5 to 8 specific, highly relevant Bengali tags for SEO (covering mentioned people, organizations, political parties, locations, and topic keywords). Always include 'kstnews24' as one of the tags.\n\n"
             . "RAW TELEGRAM POST TO REWRITE:\n\"\"\"\n" . $safe_text . "\n\"\"\"\n\n"
             . "OUTPUT FORMAT REQUIREMENT:\n"
             . "Return ONLY one valid raw JSON object. Do not wrap in markdown fences or quotes. Keep all HTML tags inside articleHtml on a single escaped line with double quotes escaped as \\\" or use single quotes for HTML attributes.\n"
@@ -560,7 +744,7 @@ class KSTNews_AI_AutoPilot {
             . "  \"metaDescription\": \"130-150 character Bengali meta summary\",\n"
             . "  \"categories\": [\"জাতীয়\"],\n"
             . "  \"articleHtml\": \"<p>ঢাকা: [Full Bengali news content...]</p><h2>[Subheading 1]</h2><p>[Paragraph...]</p><h2>[Subheading 2]</h2><p>[Paragraph...]</p>\",\n"
-            . "  \"tags\": [\"kstnews24\"]\n"
+            . "  \"tags\": [\"ঢাকা\", \"বাংলাদেশ\", \"ঘটনা\", \"প্রশাসন\", \"জাতীয় সংবাদ\", \"kstnews24\"]\n"
             . "}";
 
         $res = $this->call_openrouter_raw($api_key, $model, $prompt, 4096, 45);
@@ -836,6 +1020,10 @@ class KSTNews_AI_AutoPilot {
         $logs       = get_option($this->log_key, []);
         $last_id    = get_option($this->state_key, 0);
         $ajax_nonce = wp_create_nonce('kst_ai_ajax_nonce');
+        $count_24h  = $this->get_24h_post_count();
+        $limit_24h  = (int) ($settings['daily_limit'] ?? 150);
+        $last_cron  = (int) get_option('kstnews_ai_last_cron_run', 0);
+        $worker_url = add_query_arg('kstnews_auto_worker', '1', home_url('/'));
         ?>
         <div class="wrap">
             <h1>KSTNews24 AI Telegram AutoPilot (OpenRouter Edition)</h1>
@@ -870,6 +1058,20 @@ class KSTNews_AI_AutoPilot {
                                 </td>
                             </tr>
                             <tr>
+                                <th>Daily Post Limit (24h)</th>
+                                <td>
+                                    <input type="number" name="daily_limit" min="1" max="1000" value="<?php echo esc_attr($settings['daily_limit'] ?? 150); ?>" class="small-text" />
+                                    <p class="description">Maximum posts to publish in a 24-hour window (Default: <code>150</code>). Autopilot pauses automatically when this limit is reached.</p>
+                                </td>
+                            </tr>
+                            <tr>
+                                <th>Post Author Name</th>
+                                <td>
+                                    <input type="text" name="author_name" value="<?php echo esc_attr($settings['author_name'] ?? 'ওপেন সোর্স প্রতিনিধি'); ?>" class="regular-text" />
+                                    <p class="description">Default: <code>ওপেন সোর্স প্রতিনিধি</code>. Posts will be attributed to this author.</p>
+                                </td>
+                            </tr>
+                            <tr>
                                 <th>Default Post Status</th>
                                 <td>
                                     <select name="post_status">
@@ -883,7 +1085,7 @@ class KSTNews_AI_AutoPilot {
                                 <td>
                                     <label>
                                         <input type="checkbox" name="auto_cron" value="1" <?php checked($settings['auto_cron'], 1); ?> />
-                                        Check channel automatically in the background
+                                        Check channel automatically every 10 minutes in the background
                                     </label>
                                 </td>
                             </tr>
@@ -897,14 +1099,26 @@ class KSTNews_AI_AutoPilot {
                 <div style="background:#fff; padding:20px; border:1px solid #ccd0d4; border-radius:6px; flex:1; min-width:340px;">
                     <h2>2. Manual Trigger & State</h2>
                     <p><strong>Last Processed Telegram ID:</strong> <code><?php echo esc_html($last_id ?: 'None yet'); ?></code></p>
-                    <p><strong>Media Mode:</strong> <code>Direct Telegram Photo/Video Resize (1200x630 PHP GD)</code></p>
+                    <p><strong>24-Hour Published Count:</strong> <code><?php echo esc_html($count_24h); ?> / <?php echo esc_html($limit_24h); ?> posts</code></p>
+                    <p><strong>Post Author:</strong> <code><?php echo esc_html($settings['author_name'] ?? 'ওপেন সোর্স প্রতিনিধি'); ?></code></p>
+                    <p><strong>Last Automated Run:</strong>
+                        <code><?php
+                            echo $last_cron ? esc_html(human_time_diff($last_cron, time()) . ' ago (' . date_i18n('Y-m-d H:i:s', $last_cron) . ')') : 'None recorded yet';
+                        ?></code>
+                    </p>
                     <p><strong>Scheduler Status:</strong>
                         <code><?php
                             $next = wp_next_scheduled('kstnews_ai_cron_hook');
-                            echo $next ? 'Active (Next check: ' . date_i18n('Y-m-d H:i:s', $next) . ')' : 'Manual Mode Only';
+                            echo $next ? 'Active (Next WP-Cron check: ' . date_i18n('Y-m-d H:i:s', $next) . ')' : 'Manual Mode Only';
                         ?></code>
                     </p>
-                    <div style="margin-top:24px; display:flex; gap:12px;">
+                    <div style="background:#f8fafc; border:1px solid #e2e8f0; border-radius:6px; padding:12px; margin-top:14px;">
+                        <strong style="display:block; margin-bottom:4px; font-size:13px; color:#1e293b;">⚡ Guaranteed 10-Min Execution (External Webhook / Cron):</strong>
+                        <p style="margin:0 0 6px; font-size:12px; color:#64748b;">If LiteSpeed Cache prevents WordPress internal cron from triggering, set an external cron (cPanel Cron, Cron-Job.org, or UptimeRobot) every 10 minutes targeting:</p>
+                        <input type="text" readonly value="<?php echo esc_url($worker_url); ?>" style="width:100%; font-family:monospace; font-size:12px; background:#fff;" onclick="this.select();" />
+                        <p style="margin:6px 0 0; font-size:11px; color:#64748b;">cPanel Cron Command: <code>curl -s "<?php echo esc_url($worker_url); ?>" > /dev/null 2>&1</code></p>
+                    </div>
+                    <div style="margin-top:20px; display:flex; gap:12px;">
                         <button type="button" id="kst-open-modal-btn" class="button button-secondary button-hero">Fetch & Publish Now</button>
                         <form method="post" style="display:inline;">
                             <?php wp_nonce_field('kst_ai_nonce'); ?>
