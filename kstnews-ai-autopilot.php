@@ -199,19 +199,23 @@ class KSTNews_AI_AutoPilot {
             return false;
         }
 
-        global $wpdb;
-        $exists = $wpdb->get_var($wpdb->prepare(
-            "SELECT post_id FROM {$wpdb->postmeta} WHERE meta_key = '_kst_telegram_msg_id' AND meta_value = %s LIMIT 1",
-            (string) $msg_id
-        ));
-        if (!empty($exists)) {
+        $existing = get_posts([
+            'post_type'      => 'post',
+            'post_status'    => ['publish', 'draft', 'pending'],
+            'meta_key'       => '_kst_telegram_msg_id',
+            'meta_value'     => (string) $msg_id,
+            'posts_per_page' => 1,
+            'fields'         => 'ids',
+            'no_found_rows'  => true,
+        ]);
+        if (!empty($existing)) {
             return true;
         }
 
         $logs = get_option($this->log_key, []);
         if (is_array($logs)) {
             foreach ($logs as $log) {
-                if (!empty($log['msg_id']) && (int) $log['msg_id'] === $msg_id && !empty($log['status']) && $log['status'] === 'Published') {
+                if (!empty($log['msg_id']) && (int) $log['msg_id'] === $msg_id && !empty($log['status']) && strpos($log['status'], 'Published') !== false) {
                     return true;
                 }
             }
@@ -1174,9 +1178,9 @@ class KSTNews_AI_AutoPilot {
                     </p>
                     <div style="background:#f8fafc; border:1px solid #e2e8f0; border-radius:6px; padding:12px; margin-top:14px;">
                         <strong style="display:block; margin-bottom:4px; font-size:13px; color:#1e293b;">⚡ Guaranteed 10-Min Execution (External Webhook / Cron):</strong>
-                        <p style="margin:0 0 6px; font-size:12px; color:#64748b;">If LiteSpeed Cache prevents WordPress internal cron from triggering, set an external cron (cPanel Cron, Cron-Job.org, or UptimeRobot) every 10 minutes targeting:</p>
+                        <p style="margin:0 0 6px; font-size:12px; color:#64748b;">If LiteSpeed Cache prevents WordPress internal cron from triggering, set an external cron (cPanel Cron, Cron-Job.org, or UptimeRobot) every 10 minutes requesting this URL:</p>
                         <input type="text" readonly value="<?php echo esc_url($worker_url); ?>" style="width:100%; font-family:monospace; font-size:12px; background:#fff;" onclick="this.select();" />
-                        <p style="margin:6px 0 0; font-size:11px; color:#64748b;">cPanel Cron Command: <code>curl -s "<?php echo esc_url($worker_url); ?>" > /dev/null 2>&1</code></p>
+                        <p style="margin:6px 0 0; font-size:11px; color:#64748b;">Schedule: every 10 minutes (<code>*/10 * * * *</code>).</p>
                     </div>
                     <div style="margin-top:20px; display:flex; gap:12px;">
                         <button type="button" id="kst-open-modal-btn" class="button button-secondary button-hero">Fetch & Publish Now</button>
