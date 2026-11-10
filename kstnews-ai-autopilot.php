@@ -24,7 +24,6 @@ class KSTNews_AI_AutoPilot {
         'post_status'  => 'draft',
         'auto_cron'    => 1,
         'daily_limit'  => 150,
-        'author_name'  => 'ওপেন সোর্স প্রতিনিধি',
     ];
 
     public function __construct() {
@@ -106,20 +105,6 @@ class KSTNews_AI_AutoPilot {
         $cutoff    = time() - 86400;
         $history   = array_values(array_filter($history, fn($t) => is_numeric($t) && (int) $t > $cutoff));
         update_option('kstnews_ai_24h_history', $history);
-    }
-
-    public function get_ai_author_id(string $name = 'ওপেন সোর্স প্রতিনিধি'): int {
-        $name = trim($name) ?: 'ওপেন সোর্স প্রতিনিধি';
-
-        // Search existing users by display name, login, or nickname
-        $all_users = get_users(['number' => 100]);
-        foreach ($all_users as $u) {
-            if (trim($u->display_name) === $name || trim($u->user_login) === $name || trim($u->nickname) === $name) {
-                return (int) $u->ID;
-            }
-        }
-
-        return get_current_user_id() ?: 1;
     }
 
     public function get_free_models_list(): array {
@@ -249,7 +234,6 @@ class KSTNews_AI_AutoPilot {
                 'post_status'  => sanitize_text_field($_POST['post_status'] ?? 'draft'),
                 'auto_cron'    => isset($_POST['auto_cron']) ? 1 : 0,
                 'daily_limit'  => max(1, absint($_POST['daily_limit'] ?? 150)),
-                'author_name'  => sanitize_text_field($_POST['author_name'] ?? 'ওপেন সোর্স প্রতিনিধি'),
             ];
             update_option($this->option_key, $settings);
 
@@ -271,7 +255,7 @@ class KSTNews_AI_AutoPilot {
         check_ajax_referer('kst_ai_ajax_nonce', 'security');
         if (!current_user_can('manage_options')) {
             if (ob_get_length()) ob_clean();
-            wp_send_json_error(['message' => 'Unauthorized user.']);
+            wp_send_json_error(['message' => 'Unauthorized access.']);
         }
 
         $settings = $this->get_settings();
@@ -308,7 +292,7 @@ class KSTNews_AI_AutoPilot {
         check_ajax_referer('kst_ai_ajax_nonce', 'security');
         if (!current_user_can('manage_options')) {
             if (ob_get_length()) ob_clean();
-            wp_send_json_error(['message' => 'Unauthorized user.']);
+            wp_send_json_error(['message' => 'Unauthorized access.']);
         }
 
         $result = $this->run_pipeline(true);
@@ -525,16 +509,12 @@ class KSTNews_AI_AutoPilot {
 
         $content .= '<hr/><p><strong>ট্যাগসমূহ:</strong><br/>' . esc_html(implode(', ', $tags)) . '</p>';
 
-        $author_name = !empty($settings['author_name']) ? $settings['author_name'] : 'ওপেন সোর্স প্রতিনিধি';
-        $author_id   = $this->get_ai_author_id($author_name);
-
         $post_id = wp_insert_post([
             'post_title'     => wp_strip_all_tags($news['title']),
             'post_name'      => sanitize_title($news['englishSlug'] ?? $news['title']),
             'post_excerpt'   => sanitize_text_field($news['metaDescription'] ?? ''),
             'post_content'   => $content,
             'post_status'    => $status,
-            'post_author'    => $author_id,
             'post_category'  => $cat_ids,
             'tags_input'     => $tags,
             'ping_status'    => 'closed',
@@ -1058,7 +1038,7 @@ class KSTNews_AI_AutoPilot {
                                     </div>
 
                                     <p class="description">
-                                        ⚡ <strong>Smart Token Auto-Cascade:</strong> If this model reaches its rate/token limit after 4-5 posts, the plugin automatically rotates through the other free models (Gemma 4, Nemotron Lightning/Ultra, Dots3-Note, LiquidAI, etc.) so publishing never stops!
+                                        <strong>Smart Token Auto-Cascade:</strong> If this model reaches its rate/token limit after 4-5 posts, the plugin automatically rotates through the other free models (Gemma 4, Nemotron Lightning/Ultra, Dots3-Note, LiquidAI, etc.) so publishing never stops!
                                     </p>
                                 </td>
                             </tr>
@@ -1074,13 +1054,6 @@ class KSTNews_AI_AutoPilot {
                                 <td>
                                     <input type="number" name="daily_limit" min="1" max="1000" value="<?php echo esc_attr($settings['daily_limit'] ?? 150); ?>" class="small-text" />
                                     <p class="description">Maximum posts to publish in a 24-hour window (Default: <code>150</code>). Autopilot pauses automatically when this limit is reached.</p>
-                                </td>
-                            </tr>
-                            <tr>
-                                <th>Post Author Name</th>
-                                <td>
-                                    <input type="text" name="author_name" value="<?php echo esc_attr($settings['author_name'] ?? 'ওপেন সোর্স প্রতিনিধি'); ?>" class="regular-text" />
-                                    <p class="description">Default: <code>ওপেন সোর্স প্রতিনিধি</code>. Posts will be attributed to this author.</p>
                                 </td>
                             </tr>
                             <tr>
@@ -1112,7 +1085,6 @@ class KSTNews_AI_AutoPilot {
                     <h2>2. Manual Trigger & State</h2>
                     <p><strong>Last Processed Telegram ID:</strong> <code><?php echo esc_html($last_id ?: 'None yet'); ?></code></p>
                     <p><strong>24-Hour Published Count:</strong> <code><?php echo esc_html($count_24h); ?> / <?php echo esc_html($limit_24h); ?> posts</code></p>
-                    <p><strong>Post Author:</strong> <code><?php echo esc_html($settings['author_name'] ?? 'ওপেন সোর্স প্রতিনিধি'); ?></code></p>
                     <p><strong>Last Automated Run:</strong>
                         <code><?php
                             echo $last_cron ? esc_html(human_time_diff($last_cron, time()) . ' ago (' . date_i18n('Y-m-d H:i:s', $last_cron) . ')') : 'None recorded yet';
@@ -1125,10 +1097,10 @@ class KSTNews_AI_AutoPilot {
                         ?></code>
                     </p>
                     <div style="background:#f8fafc; border:1px solid #e2e8f0; border-radius:6px; padding:12px; margin-top:14px;">
-                        <strong style="display:block; margin-bottom:4px; font-size:13px; color:#1e293b;">⚡ Guaranteed 10-Min Execution (External Webhook / Cron):</strong>
+                        <strong style="display:block; margin-bottom:4px; font-size:13px; color:#1e293b;">Guaranteed 10-Min Execution (External Webhook / Cron):</strong>
                         <p style="margin:0 0 6px; font-size:12px; color:#64748b;">If LiteSpeed Cache prevents WordPress internal cron from triggering, set an external cron (cPanel Cron, Cron-Job.org, or UptimeRobot) every 10 minutes requesting this URL:</p>
                         <input type="text" readonly id="kst-worker-url-input" value="<?php echo esc_url($worker_url); ?>" style="width:100%; font-family:monospace; font-size:12px; background:#fff;" />
-                        <p style="margin:6px 0 0; font-size:11px; color:#64748b;">Schedule: every 10 minutes (<code>*/10 * * * *</code>).</p>
+                        <p style="margin:6px 0 0; font-size:11px; color:#64748b;">Schedule: Every 10 minutes.</p>
                     </div>
                     <div style="margin-top:20px; display:flex; gap:12px;">
                         <button type="button" id="kst-open-modal-btn" class="button button-secondary button-hero">Fetch & Publish Now</button>
@@ -1313,7 +1285,7 @@ class KSTNews_AI_AutoPilot {
                 progressInterval = setInterval(() => {
                     if (secondsRemaining > 1) {
                         secondsRemaining--;
-                        timerLabel.innerText = `Estimated time remaining: ${secondsRemaining}s`;
+                        timerLabel.innerText = 'Estimated time remaining: ' + secondsRemaining + 's';
                     } else {
                         timerLabel.innerText = 'Finalizing WordPress post...';
                     }
@@ -1360,7 +1332,7 @@ class KSTNews_AI_AutoPilot {
 
                         if (data.data.published && data.data.published.length > 0) {
                             const p = data.data.published[0];
-                            resultBox.innerHTML = `<strong>Headline:</strong> ${p.title}<br/><a href="${p.link}" target="_blank" style="display:inline-block; margin-top:8px; color:#2563eb; font-weight:600;">View Published Draft &rarr;</a>`;
+                            resultBox.innerHTML = '<strong>Headline:</strong> ' + p.title + '<br/><a href="' + p.link + '" target="_blank" style="display:inline-block; margin-top:8px; color:#2563eb; font-weight:600;">View Published Draft &rarr;</a>';
                             resultBox.style.display = 'block';
                         }
                     } else if (data.success && data.data.status === 'info') {
