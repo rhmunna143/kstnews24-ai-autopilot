@@ -18,4 +18,4 @@ desktop.ini
 *.log
 
 # Built zip packages (if kept in root or gitignored)
-# We may keep kstnews-ai-autopilot.zip or allow committing it depending on repo needs.
+kstnews-ai-autopilot.zip
