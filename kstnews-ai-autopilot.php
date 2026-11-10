@@ -52,9 +52,6 @@ class KSTNews_AI_AutoPilot {
         if (isset($_GET['kstnews_auto_worker'])) {
             // Bypass page caching plugins (LiteSpeed Cache, Cloudflare, etc.)
             nocache_headers();
-            if (function_exists('set_time_limit')) {
-                @set_time_limit(180);
-            }
             $result = $this->run_pipeline(false);
             delete_transient('kstnews_ai_cron_lock');
             header('Content-Type: application/json; charset=utf-8');
@@ -345,10 +342,6 @@ class KSTNews_AI_AutoPilot {
         if (!current_user_can('manage_options')) {
             if (ob_get_length()) ob_clean();
             wp_send_json_error(['message' => 'Unauthorized user.']);
-        }
-
-        if (function_exists('set_time_limit')) {
-            @set_time_limit(120);
         }
 
         $result = $this->run_pipeline(true);
@@ -667,38 +660,27 @@ class KSTNews_AI_AutoPilot {
 
             $json_payload = wp_json_encode($payload);
 
-            $ch = curl_init();
-            curl_setopt_array($ch, [
-                CURLOPT_URL            => $endpoint,
-                CURLOPT_POST           => true,
-                CURLOPT_POSTFIELDS     => $json_payload,
-                CURLOPT_RETURNTRANSFER => true,
-                CURLOPT_HTTPHEADER     => [
-                    'Content-Type: application/json; charset=utf-8',
-                    'Authorization: Bearer ' . trim($api_key),
-                    'HTTP-Referer: ' . home_url('/'),
-                    'X-Title: KSTNews24 AI AutoPilot',
+            $response = wp_remote_post($endpoint, [
+                'headers'     => [
+                    'Content-Type'  => 'application/json; charset=utf-8',
+                    'Authorization' => 'Bearer ' . trim($api_key),
+                    'HTTP-Referer'  => home_url('/'),
+                    'X-Title'       => 'KSTNews24 AI AutoPilot',
                 ],
-                CURLOPT_CONNECTTIMEOUT => 10,
-                CURLOPT_TIMEOUT        => $timeout,
-                CURLOPT_IPRESOLVE      => CURL_IPRESOLVE_V4,
-                CURLOPT_HTTP_VERSION   => CURL_HTTP_VERSION_1_1,
-                CURLOPT_SSL_VERIFYPEER => false,
-                CURLOPT_SSL_VERIFYHOST => 0,
+                'body'        => $json_payload,
+                'timeout'     => $timeout,
+                'sslverify'   => false,
+                'data_format' => 'body',
             ]);
 
-            $raw_body   = curl_exec($ch);
-            $curl_errno = curl_errno($ch);
-            $curl_error = curl_error($ch);
-            $http_code  = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
-            curl_close($ch);
-
-            if ($curl_errno !== 0) {
-                $last_error = "cURL error ({$curl_errno}) on {$try_model}: {$curl_error}";
+            if (is_wp_error($response)) {
+                $last_error = "HTTP error on {$try_model}: " . $response->get_error_message();
                 continue;
             }
 
-            $data = json_decode($raw_body, true);
+            $http_code = (int) wp_remote_retrieve_response_code($response);
+            $raw_body  = wp_remote_retrieve_body($response);
+            $data      = json_decode($raw_body, true);
 
             if ($http_code !== 200 || isset($data['error']) || isset($data['choices'][0]['error'])) {
                 $err_msg = $data['error']['message']
@@ -858,7 +840,7 @@ class KSTNews_AI_AutoPilot {
             }
 
             // Sanitized control characters (newlines, tabs inside unescaped strings)
-            $sanitized = preg_replace('/[\x00-\x1F\x7F]/u', ' ', $candidate);
+            $sanitized = preg_replace('/[[:cntrl:]]/u', ' ', $candidate);
             $p = json_decode($sanitized, true);
             if (is_array($p) && (isset($p['isGenuineNews']) || isset($p['title']))) {
                 return $p;
@@ -879,7 +861,7 @@ class KSTNews_AI_AutoPilot {
                         if (is_array($p) && (isset($p['isGenuineNews']) || isset($p['title']))) {
                             return $p;
                         }
-                        $sanitized = preg_replace('/[\x00-\x1F\x7F]/u', ' ', $candidate);
+                        $sanitized = preg_replace('/[[:cntrl:]]/u', ' ', $candidate);
                         $p = json_decode($sanitized, true);
                         if (is_array($p) && (isset($p['isGenuineNews']) || isset($p['title']))) {
                             return $p;
@@ -897,7 +879,7 @@ class KSTNews_AI_AutoPilot {
         $results = [];
         libxml_use_internal_errors(true);
         $dom = new DOMDocument();
-        $dom->loadHTML('<?xml encoding="UTF-8">' . $html);
+        $dom->loadHTML('<!DOCTYPE html><html><head><meta http-equiv="Content-Type" content="text/html; charset=utf-8"></head><body>' . $html . '</body></html>');
         $xpath = new DOMXPath($dom);
 
         $nodes = $xpath->query("//div[contains(@class, 'tgme_widget_message') and @data-post]");
