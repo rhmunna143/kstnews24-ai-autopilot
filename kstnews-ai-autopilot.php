@@ -19,7 +19,7 @@ class KSTNews_AI_AutoPilot {
 
     private array $defaults = [
         'or_api_key'   => '',
-        'or_model'     => 'nvidia/nemotron-3.5-super-vl:free',
+        'or_model'     => 'google/gemma-4-31b-it:free',
         'tg_channel'   => 'basherkella',
         'post_status'  => 'draft',
         'auto_cron'    => 1,
@@ -158,6 +158,22 @@ class KSTNews_AI_AutoPilot {
         return get_current_user_id() ?: 1;
     }
 
+    public function get_free_models_list(): array {
+        return [
+            'google/gemma-4-31b-it:free'                   => 'Google: Gemma 4 31B (Free - Recommended)',
+            'google/gemma-4-26b-a4b-it:free'               => 'Google: Gemma 4 26B A4B (Free)',
+            'nvidia/nemotron-3.5-lightning:free'           => 'NVIDIA: Nemotron 3.5 Lightning (Free - Fast)',
+            'nvidia/nemotron-3-ultra-550b-a55b:free'       => 'NVIDIA: Nemotron 3 Ultra 550B (Free)',
+            'nvidia/nemotron-3.5-super-vl:free'            => 'NVIDIA: Nemotron 3.5 Super VL (Free)',
+            'dots-studio/dots-3-note-preview:free'         => 'Dots Studio: Dots3-Note Preview (Free)',
+            'liquid/lfm-2.5-2.6b:free'                     => 'LiquidAI: LFM 2.5-2.6B (Free)',
+            'liquid/lfm-3-1.7b:free'                       => 'LiquidAI: LFM 3-1.7B (Free)',
+            'thinkingmachines/inkling-2-small:free'        => 'Thinking Machines: Inkling 2 Small (Free)',
+            'nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free' => 'NVIDIA: Nemotron 3 Nano Omni (Free)',
+            'openrouter/free'                              => 'OpenRouter: Free Auto-Router (Free)',
+        ];
+    }
+
     public function disable_self_pingbacks(&$links): void {
         $home = home_url();
         foreach ($links as $l => $link) {
@@ -260,7 +276,7 @@ class KSTNews_AI_AutoPilot {
         if (isset($_POST['kst_save_settings']) && check_admin_referer('kst_ai_nonce')) {
             $settings = [
                 'or_api_key'   => sanitize_text_field($_POST['or_api_key'] ?? ''),
-                'or_model'     => sanitize_text_field($_POST['or_model'] ?? 'nvidia/nemotron-3.5-super-vl:free'),
+                'or_model'     => sanitize_text_field($_POST['or_model'] ?? 'google/gemma-4-31b-it:free'),
                 'tg_channel'   => sanitize_text_field($_POST['tg_channel'] ?? 'basherkella'),
                 'post_status'  => sanitize_text_field($_POST['post_status'] ?? 'draft'),
                 'auto_cron'    => isset($_POST['auto_cron']) ? 1 : 0,
@@ -300,7 +316,8 @@ class KSTNews_AI_AutoPilot {
         }
 
         $start    = microtime(true);
-        $res      = $this->call_openrouter_raw($api_key, $model, 'Reply with the single word: OK', 500, 25);
+        // Test the selected model specifically without silent cascade
+        $res      = $this->call_openrouter_raw($api_key, $model, 'Reply with the single word: OK', 500, 25, false);
         $duration = round(microtime(true) - $start, 2);
 
         if (ob_get_length()) {
@@ -572,13 +589,17 @@ class KSTNews_AI_AutoPilot {
             update_option($this->state_key, max($last_id, $msg_id));
             $this->record_published_post_timestamp();
 
+            $used_model = $news['used_model'] ?? $model;
+            $model_note = ($used_model !== $model) ? " (fallback: " . esc_html($used_model) . ")" : "";
+
             $permalink = get_permalink($post_id);
-            $this->add_log($msg_id, 'Published', '<a href="' . esc_url($permalink) . '" target="_blank">' . esc_html($news['title']) . '</a>');
+            $this->add_log($msg_id, 'Published' . $model_note, '<a href="' . esc_url($permalink) . '" target="_blank">' . esc_html($news['title']) . '</a>');
             $published_posts[] = [
                 'id'    => $post_id,
                 'title' => $news['title'],
                 'link'  => $permalink,
                 'msg'   => $msg_id,
+                'model' => $used_model,
             ];
         }
 
@@ -586,30 +607,40 @@ class KSTNews_AI_AutoPilot {
             delete_transient('kstnews_ai_pipeline_lock');
         }
 
+        $used_model  = $news['used_model'] ?? $model;
+        $success_msg = 'Article generated and saved successfully via OpenRouter!' . (($used_model !== $model) ? " (Used fallback model: {$used_model})" : "");
+
         return [
             'status'    => 'success',
-            'message'   => 'Article generated and saved successfully via OpenRouter!',
+            'message'   => $success_msg,
             'published' => $published_posts,
             'last_id'   => max($last_id, $msg_id ?? $last_id),
         ];
     }
 
-    private function call_openrouter_raw(string $api_key, string $model, string $prompt, int $max_tokens = 4096, int $timeout = 45): array {
-        $clean_model = trim($model) ?: 'nvidia/nemotron-3.5-super-vl:free';
+    private function call_openrouter_raw(string $api_key, string $model, string $prompt, int $max_tokens = 2200, int $timeout = 45, bool $allow_fallback = true): array {
+        $clean_model = trim($model) ?: 'google/gemma-4-31b-it:free';
         $endpoint    = 'https://openrouter.ai/api/v1/chat/completions';
 
-        // High quality active free models on OpenRouter with reliable fallbacks
-        $candidate_models = array_values(array_filter(array_unique([
-            $clean_model,
-            'nvidia/nemotron-3.5-lightning:free',
-            'nvidia/nemotron-3-ultra-550b-a55b:free',
-            'nvidia/nemotron-3.5-super-vl:free',
-            'openrouter/free',
-        ])));
+        if ($allow_fallback) {
+            $free_pool = array_keys($this->get_free_models_list());
+            $free_pool = array_filter($free_pool, fn($m) => $m !== 'custom');
+            $candidate_models = array_values(array_filter(array_unique(array_merge(
+                [$clean_model],
+                $free_pool
+            ))));
+        } else {
+            $candidate_models = [$clean_model];
+        }
 
         $last_error = 'Empty output from all candidate models.';
 
         foreach ($candidate_models as $try_model) {
+            // If another candidate model was rate-limited in the past 90 seconds, skip to a fresh one
+            if ($try_model !== $clean_model && get_transient('kst_rl_' . md5($try_model))) {
+                continue;
+            }
+
             $payload = [
                 'model'       => $try_model,
                 'messages'    => [
@@ -673,6 +704,11 @@ class KSTNews_AI_AutoPilot {
                     $err_msg = wp_json_encode($err_msg);
                 }
                 $last_error = "OpenRouter ({$try_model} - {$http_code}): {$err_msg}";
+
+                // If rate limited or quota exceeded, temporarily cool down this model for 90 seconds
+                if ($http_code === 429 || $http_code === 402 || stripos((string)$err_msg, 'rate limit') !== false || stripos((string)$err_msg, 'quota') !== false || stripos((string)$err_msg, 'exceeded') !== false) {
+                    set_transient('kst_rl_' . md5($try_model), 1, 90);
+                }
                 continue;
             }
 
@@ -714,6 +750,9 @@ class KSTNews_AI_AutoPilot {
 
             $finish_reason = $data['choices'][0]['finish_reason'] ?? 'unknown';
             $last_error    = "Empty output from {$try_model} (finish_reason: {$finish_reason})";
+            if ($finish_reason === 'length') {
+                set_transient('kst_rl_' . md5($try_model), 1, 60);
+            }
         }
 
         return ['error' => $last_error];
@@ -747,7 +786,7 @@ class KSTNews_AI_AutoPilot {
             . "  \"tags\": [\"ঢাকা\", \"বাংলাদেশ\", \"ঘটনা\", \"প্রশাসন\", \"জাতীয় সংবাদ\", \"kstnews24\"]\n"
             . "}";
 
-        $res = $this->call_openrouter_raw($api_key, $model, $prompt, 4096, 45);
+        $res = $this->call_openrouter_raw($api_key, $model, $prompt, 2200, 45, true);
         if (isset($res['error'])) {
             return ['error' => $res['error']];
         }
@@ -768,6 +807,7 @@ class KSTNews_AI_AutoPilot {
             return ['error' => 'AI returned placeholder or empty title. Try again or check post text.'];
         }
 
+        $parsed['used_model'] = $res['model'] ?? $model;
         return $parsed;
     }
 
@@ -1046,8 +1086,28 @@ class KSTNews_AI_AutoPilot {
                             <tr>
                                 <th>Free Text Model</th>
                                 <td>
-                                    <input type="text" id="kst-or-model" name="or_model" value="<?php echo esc_attr($settings['or_model']); ?>" class="regular-text" />
-                                    <p class="description">Default: <code>nvidia/nemotron-3.5-super-vl:free</code> (Auto-falls back to Nemotron Lightning / Ultra 550B / <code>openrouter/free</code>)</p>
+                                    <?php
+                                    $free_models   = $this->get_free_models_list();
+                                    $current_model = !empty($settings['or_model']) ? $settings['or_model'] : 'google/gemma-4-31b-it:free';
+                                    $is_predefined = array_key_exists($current_model, $free_models);
+                                    ?>
+                                    <select id="kst-or-model-select" class="regular-text" style="max-width:420px; display:block; margin-bottom:8px;">
+                                        <?php foreach ($free_models as $slug => $label): ?>
+                                            <option value="<?php echo esc_attr($slug); ?>" <?php selected($is_predefined && $current_model === $slug); ?>>
+                                                <?php echo esc_html($label); ?>
+                                            </option>
+                                        <?php endforeach; ?>
+                                        <option value="custom" <?php selected(!$is_predefined); ?>>Custom / Other Model Slug...</option>
+                                    </select>
+
+                                    <div id="kst-custom-model-wrap" style="<?php echo $is_predefined ? 'display:none;' : 'display:block;'; ?> margin-bottom:8px;">
+                                        <input type="text" id="kst-or-model" name="or_model" value="<?php echo esc_attr($current_model); ?>" class="regular-text" placeholder="e.g. google/gemma-4-31b-it:free" />
+                                        <span class="description" style="display:block; font-size:12px; color:#64748b; margin-top:4px;">Enter any valid OpenRouter model slug.</span>
+                                    </div>
+
+                                    <p class="description">
+                                        ⚡ <strong>Smart Token Auto-Cascade:</strong> If this model reaches its rate/token limit after 4-5 posts, the plugin automatically rotates through the other free models (Gemma 4, Nemotron Lightning/Ultra, Dots3-Note, LiquidAI, etc.) so publishing never stops!
+                                    </p>
                                 </td>
                             </tr>
                             <tr>
@@ -1196,6 +1256,22 @@ class KSTNews_AI_AutoPilot {
                     }
                     throw new Error('Server returned invalid response: ' + rawText.replace(/<[^>]*>?/gm, '').trim().substring(0, 140));
                 }
+            }
+
+            const modelSelect = document.getElementById('kst-or-model-select');
+            const modelWrap   = document.getElementById('kst-custom-model-wrap');
+            const modelInput  = document.getElementById('kst-or-model');
+
+            if (modelSelect && modelInput) {
+                modelSelect.addEventListener('change', function() {
+                    if (this.value === 'custom') {
+                        if (modelWrap) modelWrap.style.display = 'block';
+                        modelInput.focus();
+                    } else {
+                        if (modelWrap) modelWrap.style.display = 'none';
+                        modelInput.value = this.value;
+                    }
+                });
             }
 
             const testBtn = document.getElementById('kst-test-api-btn');
