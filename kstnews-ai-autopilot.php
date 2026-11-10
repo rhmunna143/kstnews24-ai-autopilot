@@ -54,9 +54,7 @@ class KSTNews_AI_AutoPilot {
             nocache_headers();
             $result = $this->run_pipeline(false);
             delete_transient('kstnews_ai_cron_lock');
-            header('Content-Type: application/json; charset=utf-8');
-            echo wp_json_encode($result);
-            exit;
+            wp_send_json($result);
         }
     }
 
@@ -79,9 +77,8 @@ class KSTNews_AI_AutoPilot {
                 // Spawn async non-blocking execution to worker endpoint
                 $url = add_query_arg('kstnews_auto_worker', '1', home_url('/'));
                 wp_remote_get($url, [
-                    'timeout'   => 2,
-                    'blocking'  => false,
-                    'sslverify' => false,
+                    'timeout'  => 2,
+                    'blocking' => false,
                 ]);
             }
         }
@@ -111,45 +108,15 @@ class KSTNews_AI_AutoPilot {
         update_option('kstnews_ai_24h_history', $history);
     }
 
-    public function get_or_create_ai_author_id(string $name = 'ওপেন সোর্স প্রতিনিধি'): int {
+    public function get_ai_author_id(string $name = 'ওপেন সোর্স প্রতিনিধি'): int {
         $name = trim($name) ?: 'ওপেন সোর্স প্রতিনিধি';
 
-        // 1. Check if user exists by dedicated login
-        $user = get_user_by('login', 'opensource_reporter');
-        if ($user) {
-            if ($user->display_name !== $name) {
-                wp_update_user([
-                    'ID'           => $user->ID,
-                    'display_name' => $name,
-                    'nickname'     => $name,
-                ]);
-            }
-            return (int) $user->ID;
-        }
-
-        // 2. Search existing users by display name or login directly
+        // Search existing users by display name, login, or nickname
         $all_users = get_users(['number' => 100]);
         foreach ($all_users as $u) {
-            if (trim($u->display_name) === $name || trim($u->user_login) === $name) {
+            if (trim($u->display_name) === $name || trim($u->user_login) === $name || trim($u->nickname) === $name) {
                 return (int) $u->ID;
             }
-        }
-
-        // 3. Create dedicated author user
-        $host = wp_parse_url(home_url(), PHP_URL_HOST) ?: 'kstnews24.com';
-        $user_id = wp_insert_user([
-            'user_login'   => 'opensource_reporter',
-            'display_name' => $name,
-            'nickname'     => $name,
-            'first_name'   => 'ওপেন সোর্স',
-            'last_name'    => 'প্রতিনিধি',
-            'user_pass'    => wp_generate_password(24, true, true),
-            'user_email'   => 'opensource@' . $host,
-            'role'         => 'author',
-        ]);
-
-        if (!is_wp_error($user_id)) {
-            return (int) $user_id;
         }
 
         return get_current_user_id() ?: 1;
@@ -185,7 +152,7 @@ class KSTNews_AI_AutoPilot {
             $home = home_url();
             $author_url = $commentdata['comment_author_url'] ?? '';
             if (!empty($author_url) && strpos($author_url, $home) === 0) {
-                wp_die(__('Internal self-pingbacks disabled.', 'kstnews-ai-autopilot'), '', ['response' => 200]);
+                $commentdata['comment_approved'] = 'trash';
             }
         }
         return $commentdata;
@@ -559,7 +526,7 @@ class KSTNews_AI_AutoPilot {
         $content .= '<hr/><p><strong>ট্যাগসমূহ:</strong><br/>' . esc_html(implode(', ', $tags)) . '</p>';
 
         $author_name = !empty($settings['author_name']) ? $settings['author_name'] : 'ওপেন সোর্স প্রতিনিধি';
-        $author_id   = $this->get_or_create_ai_author_id($author_name);
+        $author_id   = $this->get_ai_author_id($author_name);
 
         $post_id = wp_insert_post([
             'post_title'     => wp_strip_all_tags($news['title']),
@@ -669,7 +636,6 @@ class KSTNews_AI_AutoPilot {
                 ],
                 'body'        => $json_payload,
                 'timeout'     => $timeout,
-                'sslverify'   => false,
                 'data_format' => 'body',
             ]);
 
@@ -1161,14 +1127,14 @@ class KSTNews_AI_AutoPilot {
                     <div style="background:#f8fafc; border:1px solid #e2e8f0; border-radius:6px; padding:12px; margin-top:14px;">
                         <strong style="display:block; margin-bottom:4px; font-size:13px; color:#1e293b;">⚡ Guaranteed 10-Min Execution (External Webhook / Cron):</strong>
                         <p style="margin:0 0 6px; font-size:12px; color:#64748b;">If LiteSpeed Cache prevents WordPress internal cron from triggering, set an external cron (cPanel Cron, Cron-Job.org, or UptimeRobot) every 10 minutes requesting this URL:</p>
-                        <input type="text" readonly value="<?php echo esc_url($worker_url); ?>" style="width:100%; font-family:monospace; font-size:12px; background:#fff;" onclick="this.select();" />
+                        <input type="text" readonly id="kst-worker-url-input" value="<?php echo esc_url($worker_url); ?>" style="width:100%; font-family:monospace; font-size:12px; background:#fff;" />
                         <p style="margin:6px 0 0; font-size:11px; color:#64748b;">Schedule: every 10 minutes (<code>*/10 * * * *</code>).</p>
                     </div>
                     <div style="margin-top:20px; display:flex; gap:12px;">
                         <button type="button" id="kst-open-modal-btn" class="button button-secondary button-hero">Fetch & Publish Now</button>
                         <form method="post" style="display:inline;">
                             <?php wp_nonce_field('kst_ai_nonce'); ?>
-                            <button type="submit" name="kst_reset_state" class="button" onclick="return confirm('Reset state and clear logs?');">Reset State</button>
+                            <button type="submit" id="kst-reset-state-btn" name="kst_reset_state" class="button">Reset State</button>
                         </form>
                     </div>
                 </div>
@@ -1222,7 +1188,7 @@ class KSTNews_AI_AutoPilot {
 
                 <div style="display:flex; gap:12px; justify-content:center;">
                     <button type="button" id="kst-modal-cancel" class="button button-secondary" style="padding:4px 20px; font-size:14px; border-color:#cbd5e1; color:#475569;">Cancel</button>
-                    <button type="button" id="kst-modal-close" class="button button-primary" style="display:none; padding:4px 24px; font-size:14px;" onclick="location.reload();">Done & Refresh Log</button>
+                    <button type="button" id="kst-modal-close" class="button button-primary" style="display:none; padding:4px 24px; font-size:14px;">Done & Refresh Log</button>
                 </div>
             </div>
         </div>
@@ -1230,6 +1196,21 @@ class KSTNews_AI_AutoPilot {
         <script>
         (function() {
             const ajaxNonce = '<?php echo esc_js($ajax_nonce); ?>';
+
+            const workerInput = document.getElementById('kst-worker-url-input');
+            if (workerInput) {
+                workerInput.addEventListener('click', function() { this.select(); });
+            }
+            const resetBtn = document.getElementById('kst-reset-state-btn');
+            if (resetBtn) {
+                resetBtn.addEventListener('click', function(e) {
+                    if (!confirm('Reset state and clear logs?')) { e.preventDefault(); }
+                });
+            }
+            const modalClose = document.getElementById('kst-modal-close');
+            if (modalClose) {
+                modalClose.addEventListener('click', function() { location.reload(); });
+            }
 
             function parseSafeJson(rawText) {
                 try {
