@@ -28,11 +28,35 @@ class KSTNews_AI_AutoPilot {
     public function __construct() {
         add_action('admin_menu', [$this, 'register_admin_menu']);
         add_action('admin_init', [$this, 'handle_form_actions']);
+        add_action('init', [$this, 'ensure_cron_scheduled']);
         add_filter('cron_schedules', [$this, 'add_cron_interval']);
         add_action('kstnews_ai_cron_hook', [$this, 'run_pipeline']);
 
         add_action('wp_ajax_kst_run_pipeline_ajax', [$this, 'ajax_run_pipeline']);
         add_action('wp_ajax_kst_test_api_ajax', [$this, 'ajax_test_api']);
+    }
+
+    public function ensure_cron_scheduled(): void {
+        $settings = $this->get_settings();
+        if (!empty($settings['auto_cron'])) {
+            if (!wp_next_scheduled('kstnews_ai_cron_hook')) {
+                wp_schedule_event(time() + 60, 'every_ten_minutes', 'kstnews_ai_cron_hook');
+            }
+        } else {
+            if (wp_next_scheduled('kstnews_ai_cron_hook')) {
+                wp_clear_scheduled_hook('kstnews_ai_cron_hook');
+            }
+        }
+    }
+
+    public static function on_activate(): void {
+        if (!wp_next_scheduled('kstnews_ai_cron_hook')) {
+            wp_schedule_event(time() + 60, 'every_ten_minutes', 'kstnews_ai_cron_hook');
+        }
+    }
+
+    public static function on_deactivate(): void {
+        wp_clear_scheduled_hook('kstnews_ai_cron_hook');
     }
 
     private function get_settings(): array {
@@ -439,48 +463,36 @@ class KSTNews_AI_AutoPilot {
     private function polish_with_openrouter(string $raw_text, string $api_key, string $model): ?array {
         $safe_text = mb_substr(trim($raw_text), 0, 3500);
 
-        // Strict prompt containing the actual raw Telegram text variable ($safe_text)
-        $prompt = "You are the Senior News Editor for kstnews24.com.\n"
-            . "Read the following raw Telegram channel post and rewrite it into a real, professional 250-300 word Bengali news article.\n\n"
-            . "CRITICAL INSTRUCTIONS:\n"
-            . "1. DO NOT use placeholder text like 'আকর্ষণীয় বাংলা শিরোনাম' or 'ঢাকা: ...'. Write the actual news based on the post below.\n"
-            . "2. The raw text may contain apostrophes inserted to evade channel censorship (e.g. আ'গুন, দু'র্বৃ'ত্তরা). Normalize these words into correct standard Bengali (e.g. আগুন, দুর্বৃত্তরা).\n"
-            . "3. If the post is an advertisement, promotion, betting/gambling link, or spam, return: {\"isGenuineNews\": false, \"skipReason\": \"Spam/Promo/Ad\"}.\n"
-            . "4. If the post contains graphic blood, dead bodies, or severe hate speech violating Google AdSense policies, return: {\"isAdSenseSafe\": false, \"skipReason\": \"AdSense Policy Violation\"}.\n"
-            . "5. Otherwise, return a valid JSON object with the full rewritten news article:\n"
-            . "   - \"isGenuineNews\": true,\n"
-            . "   - \"isAdSenseSafe\": true,\n"
-            . "   - \"title\": Specific, compelling Bengali headline based on the post (no generic placeholders),\n"
-            . "   - \"englishSlug\": Short 3-5 word lowercase English URL slug,\n"
-            . "   - \"metaDescription\": 130-150 character Bengali meta description summary,\n"
-            . "   - \"categories\": Array of 1-2 categories (e.g. [\"জাতীয়\", \"সারাদেশ\"]),\n"
-            . "   - \"articleHtml\": Full HTML body starting with location dateline (e.g. '<p>নেত্রকোনা: [Actual news content...]</p>'), followed by 2 informative <h2> subheadings and <p> description paragraphs,\n"
-            . "   - \"tags\": Array of relevant SEO tags including 'kstnews24'.\n\n"
+        $prompt = "You are the Senior Bengali News Editor for kstnews24.com.\n"
+            . "Read the following raw Telegram post and rewrite it into a real, professional 250-300 word Bengali news article.\n\n"
+            . "EDITORIAL RULES:\n"
+            . "1. Write the actual news based on the post. Do NOT output placeholder text like 'আকর্ষণীয় বাংলা শিরোনাম' or 'ঢাকা: ...'.\n"
+            . "2. The raw post may contain anti-censorship apostrophes (e.g. আ'গুন, দু'র্বৃ'ত্তরা). Normalize these words into correct standard Bengali (e.g. আগুন, দুর্বৃত্তরা).\n"
+            . "3. If the post is an advertisement, promotion, betting/gambling link, or spam: set isGenuineNews to false and provide skipReason.\n"
+            . "4. If the post contains graphic blood, dead bodies, or severe hate speech violating Google AdSense policies: set isAdSenseSafe to false and provide skipReason.\n"
+            . "5. Otherwise, set isGenuineNews to true, isAdSenseSafe to true, and generate the full news article.\n\n"
             . "RAW TELEGRAM POST TO REWRITE:\n\"\"\"\n" . $safe_text . "\n\"\"\"\n\n"
-            . "Return ONLY a valid raw JSON object (no markdown code fences, no explanations).";
+            . "OUTPUT FORMAT REQUIREMENT:\n"
+            . "Return ONLY one valid raw JSON object. Do not wrap in markdown fences or quotes. Keep all HTML tags inside articleHtml on a single escaped line with double quotes escaped as \\\" or use single quotes for HTML attributes.\n"
+            . "Format:\n"
+            . "{\n"
+            . "  \"isGenuineNews\": true,\n"
+            . "  \"isAdSenseSafe\": true,\n"
+            . "  \"skipReason\": \"\",\n"
+            . "  \"title\": \"Specific Bengali headline based on post\",\n"
+            . "  \"englishSlug\": \"3-5-word-english-slug\",\n"
+            . "  \"metaDescription\": \"130-150 character Bengali meta summary\",\n"
+            . "  \"categories\": [\"জাতীয়\"],\n"
+            . "  \"articleHtml\": \"<p>ঢাকা: [Full Bengali news content...]</p><h2>[Subheading 1]</h2><p>[Paragraph...]</p><h2>[Subheading 2]</h2><p>[Paragraph...]</p>\",\n"
+            . "  \"tags\": [\"kstnews24\"]\n"
+            . "}";
 
         $res = $this->call_openrouter_raw($api_key, $model, $prompt, 4096, 45);
         if (isset($res['error'])) {
             return ['error' => $res['error']];
         }
 
-        $raw_output = $res['text'];
-
-        $cleaned = preg_replace('/<think>.*?<\/think>/is', '', $raw_output);
-        $cleaned = preg_replace('/^```(?:json)?\s*|\s*```$/im', '', trim($cleaned));
-
-        $first_brace = strpos($cleaned, '{');
-        $last_brace  = strrpos($cleaned, '}');
-        if ($first_brace !== false && $last_brace !== false && $last_brace > $first_brace) {
-            $cleaned = substr($cleaned, $first_brace, $last_brace - $first_brace + 1);
-        }
-
-        $parsed = json_decode($cleaned, true);
-
-        if (!$parsed) {
-            $sanitized_json = preg_replace('/[\x00-\x1F\x7F]/u', ' ', $cleaned);
-            $parsed = json_decode($sanitized_json, true);
-        }
+        $parsed = $this->extract_clean_json($res['text']);
 
         if (!$parsed) {
             return ['error' => 'AI returned invalid JSON formatting. Try again or check post text.'];
@@ -497,6 +509,84 @@ class KSTNews_AI_AutoPilot {
         }
 
         return $parsed;
+    }
+
+    private function extract_clean_json(string $raw): ?array {
+        // 1. Direct decode attempt
+        $decoded = json_decode(trim($raw), true);
+        if (is_array($decoded) && (isset($decoded['isGenuineNews']) || isset($decoded['title']))) {
+            return $decoded;
+        }
+
+        // 2. Strip think tags and code blocks
+        $cleaned = preg_replace('/<think>.*?<\/think>/is', '', $raw);
+        $cleaned = preg_replace('/^```(?:json)?\s*|\s*```$/im', '', trim($cleaned));
+        $cleaned = trim($cleaned);
+
+        $decoded = json_decode($cleaned, true);
+        if (is_array($decoded) && (isset($decoded['isGenuineNews']) || isset($decoded['title']))) {
+            return $decoded;
+        }
+
+        // 3. Scan all candidate '{' positions
+        $len = strlen($cleaned);
+        $brace_positions = [];
+        for ($i = 0; $i < $len; $i++) {
+            if ($cleaned[$i] === '{') {
+                $brace_positions[] = $i;
+            }
+        }
+
+        $last_brace = strrpos($cleaned, '}');
+        if ($last_brace === false || empty($brace_positions)) {
+            return null;
+        }
+
+        // Check each { starting point against last_brace (in reverse order first)
+        $reversed = array_reverse($brace_positions);
+        foreach ($reversed as $start) {
+            if ($start >= $last_brace) continue;
+            $candidate = substr($cleaned, $start, $last_brace - $start + 1);
+
+            $p = json_decode($candidate, true);
+            if (is_array($p) && (isset($p['isGenuineNews']) || isset($p['title']))) {
+                return $p;
+            }
+
+            // Sanitized control characters (newlines, tabs inside unescaped strings)
+            $sanitized = preg_replace('/[\x00-\x1F\x7F]/u', ' ', $candidate);
+            $p = json_decode($sanitized, true);
+            if (is_array($p) && (isset($p['isGenuineNews']) || isset($p['title']))) {
+                return $p;
+            }
+        }
+
+        // 4. Also check balanced brace pairs
+        foreach ($brace_positions as $start) {
+            $depth = 0;
+            for ($j = $start; $j < $len; $j++) {
+                if ($cleaned[$j] === '{') {
+                    $depth++;
+                } elseif ($cleaned[$j] === '}') {
+                    $depth--;
+                    if ($depth === 0) {
+                        $candidate = substr($cleaned, $start, $j - $start + 1);
+                        $p = json_decode($candidate, true);
+                        if (is_array($p) && (isset($p['isGenuineNews']) || isset($p['title']))) {
+                            return $p;
+                        }
+                        $sanitized = preg_replace('/[\x00-\x1F\x7F]/u', ' ', $candidate);
+                        $p = json_decode($sanitized, true);
+                        if (is_array($p) && (isset($p['isGenuineNews']) || isset($p['title']))) {
+                            return $p;
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+
+        return null;
     }
     
     private function parse_telegram_html(string $html): array {
@@ -978,5 +1068,8 @@ class KSTNews_AI_AutoPilot {
         <?php
     }
 }
+
+register_activation_hook(__FILE__, ['KSTNews_AI_AutoPilot', 'on_activate']);
+register_deactivation_hook(__FILE__, ['KSTNews_AI_AutoPilot', 'on_deactivate']);
 
 new KSTNews_AI_AutoPilot();
