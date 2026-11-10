@@ -32,8 +32,58 @@ class KSTNews_AI_AutoPilot {
         add_filter('cron_schedules', [$this, 'add_cron_interval']);
         add_action('kstnews_ai_cron_hook', [$this, 'run_pipeline']);
 
+        // Completely disable internal self-pingbacks and pingback comments
+        add_action('pre_ping', [$this, 'disable_self_pingbacks']);
+        add_filter('preprocess_comment', [$this, 'block_internal_pingbacks']);
+
         add_action('wp_ajax_kst_run_pipeline_ajax', [$this, 'ajax_run_pipeline']);
         add_action('wp_ajax_kst_test_api_ajax', [$this, 'ajax_test_api']);
+    }
+
+    public function disable_self_pingbacks(&$links): void {
+        $home = home_url();
+        foreach ($links as $l => $link) {
+            if (strpos($link, $home) === 0) {
+                unset($links[$l]);
+            }
+        }
+    }
+
+    public function block_internal_pingbacks(array $commentdata): array {
+        if (!empty($commentdata['comment_type']) && in_array($commentdata['comment_type'], ['pingback', 'trackback'], true)) {
+            $home = home_url();
+            $author_url = $commentdata['comment_author_url'] ?? '';
+            if (!empty($author_url) && strpos($author_url, $home) === 0) {
+                wp_die(__('Internal self-pingbacks disabled.', 'kstnews-ai-autopilot'), '', ['response' => 200]);
+            }
+        }
+        return $commentdata;
+    }
+
+    private function is_post_already_published(int $msg_id): bool {
+        if ($msg_id <= 0) {
+            return false;
+        }
+
+        global $wpdb;
+        $exists = $wpdb->get_var($wpdb->prepare(
+            "SELECT post_id FROM {$wpdb->postmeta} WHERE meta_key = '_kst_telegram_msg_id' AND meta_value = %s LIMIT 1",
+            (string) $msg_id
+        ));
+        if (!empty($exists)) {
+            return true;
+        }
+
+        $logs = get_option($this->log_key, []);
+        if (is_array($logs)) {
+            foreach ($logs as $log) {
+                if (!empty($log['msg_id']) && (int) $log['msg_id'] === $msg_id && !empty($log['status']) && $log['status'] === 'Published') {
+                    return true;
+                }
+            }
+        }
+
+        return false;
     }
 
     public function ensure_cron_scheduled(): void {
@@ -208,123 +258,149 @@ class KSTNews_AI_AutoPilot {
             return ['status' => 'error', 'message' => 'No public posts found on t.me/s/' . esc_html($channel)];
         }
 
-        $last_id = (int) get_option($this->state_key, 0);
-        $unseen  = array_filter($posts, fn($p) => $p['id'] > $last_id);
+        // Sort posts ascending by ID (oldest to newest) to process chronologically
+        usort($posts, fn($a, $b) => $a['id'] <=> $b['id']);
 
-        if ($last_id === 0 || ($is_manual && empty($unseen))) {
-            $unseen = [end($posts)];
+        $last_id = (int) get_option($this->state_key, 0);
+
+        // Find unposted candidate posts (ID > last_id AND not already published in WordPress)
+        $candidates = [];
+        foreach ($posts as $p) {
+            if ($p['id'] > $last_id && !$this->is_post_already_published($p['id'])) {
+                $candidates[] = $p;
+            }
         }
 
-        $unseen = array_slice($unseen, 0, 1);
+        // If no newer post found, check if any post in the fetched batch hasn't been published yet
+        if (empty($candidates)) {
+            foreach ($posts as $p) {
+                if (!$this->is_post_already_published($p['id'])) {
+                    $candidates[] = $p;
+                }
+            }
+        }
+
+        // If all fetched posts are already published, channel is 100% up to date
+        if (empty($candidates)) {
+            $latest_channel_id = end($posts)['id'] ?? $last_id;
+            update_option($this->state_key, max($last_id, $latest_channel_id));
+            return [
+                'status'  => 'info',
+                'message' => "All recent Telegram posts on @{$channel} have already been published in WordPress! Waiting for new channel updates (Latest: #{$latest_channel_id}).",
+            ];
+        }
+
+        // Take the earliest unposted message
+        $tg_post = $candidates[0];
+        $msg_id  = $tg_post['id'];
         $published_posts = [];
 
-        foreach ($unseen as $tg_post) {
-            $msg_id = $tg_post['id'];
+        if (mb_strlen($tg_post['text']) < 15) {
+            $this->add_log($msg_id, 'Skipped', 'Text too short for news article.');
+            update_option($this->state_key, max($last_id, $msg_id));
+            return ['status' => 'skipped', 'message' => "Post #{$msg_id} was skipped (text too short)."];
+        }
 
-            if (mb_strlen($tg_post['text']) < 15) {
-                $this->add_log($msg_id, 'Skipped', 'Text too short for news article.');
-                update_option($this->state_key, max($last_id, $msg_id));
-                return ['status' => 'skipped', 'message' => "Post #{$msg_id} was skipped (text too short)."];
-            }
+        if ($this->is_spam_or_ad($tg_post['text'])) {
+            $this->add_log($msg_id, 'Blocked Ad', 'Matched promo/spam keyword filter.');
+            update_option($this->state_key, max($last_id, $msg_id));
+            return ['status' => 'blocked', 'message' => "Post #{$msg_id} was blocked as an advertisement."];
+        }
 
-            if ($this->is_spam_or_ad($tg_post['text'])) {
-                $this->add_log($msg_id, 'Blocked Ad', 'Matched promo/spam keyword filter.');
-                update_option($this->state_key, max($last_id, $msg_id));
-                return ['status' => 'blocked', 'message' => "Post #{$msg_id} was blocked as an advertisement."];
-            }
+        $news = $this->polish_with_openrouter($tg_post['text'], $api_key, $model);
+        if (!$news || isset($news['error'])) {
+            $err = $news['error'] ?? 'Invalid AI response';
+            $this->add_log($msg_id, 'AI Error', $err);
+            return ['status' => 'error', 'message' => "AI Error on #{$msg_id}: " . $err];
+        }
 
-            $news = $this->polish_with_openrouter($tg_post['text'], $api_key, $model);
-            if (!$news || isset($news['error'])) {
-                $err = $news['error'] ?? 'Invalid AI response';
-                $this->add_log($msg_id, 'AI Error', $err);
-                return ['status' => 'error', 'message' => "AI Error on #{$msg_id}: " . $err];
-            }
+        if (empty($news['isGenuineNews']) || empty($news['isAdSenseSafe'])) {
+            $reason = $news['skipReason'] ?? 'Non-news or AdSense policy violation';
+            $this->add_log($msg_id, 'Rejected by AI', $reason);
+            update_option($this->state_key, max($last_id, $msg_id));
+            return ['status' => 'rejected', 'message' => "Post #{$msg_id} rejected by AI: " . $reason];
+        }
 
-            if (empty($news['isGenuineNews']) || empty($news['isAdSenseSafe'])) {
-                $reason = $news['skipReason'] ?? 'Non-news or AdSense policy violation';
-                $this->add_log($msg_id, 'Rejected by AI', $reason);
-                update_option($this->state_key, max($last_id, $msg_id));
-                return ['status' => 'rejected', 'message' => "Post #{$msg_id} rejected by AI: " . $reason];
-            }
-
-            $uploaded_images = [];
-            foreach ($tg_post['images'] as $idx => $img_url) {
-                $is_featured = ($idx === 0);
-                $att_id = $this->download_and_resize_image($img_url, $news['title'], $is_featured);
-                if ($att_id) {
-                    $uploaded_images[] = [
-                        'id'  => $att_id,
-                        'url' => wp_get_attachment_url($att_id),
-                    ];
-                }
-            }
-
-            $featured_id = !empty($uploaded_images)
-                ? $uploaded_images[0]['id']
-                : $this->generate_fallback_banner($news['title']);
-
-            $cat_ids = [];
-            foreach (($news['categories'] ?? ['জাতীয়']) as $cat_name) {
-                $term = term_exists($cat_name, 'category');
-                if (!$term) {
-                    $term = wp_insert_term($cat_name, 'category');
-                }
-                if (!is_wp_error($term)) {
-                    $cat_ids[] = (int) $term['term_id'];
-                }
-            }
-
-            $content = '<p><strong>ক্যাটাগরি:</strong> ' . esc_html(implode(' / ', $news['categories'] ?? ['জাতীয়'])) . '</p>';
-            $content .= '<h3><strong>বিস্তারিত সংবাদ:</strong></h3>';
-            $content .= $news['articleHtml'];
-
-            if (!empty($tg_post['video'])) {
-                $content .= '<figure class="wp-block-video"><video controls src="' . esc_url($tg_post['video']) . '" style="max-width:100%;height:auto;"></video></figure>';
-            }
-
-            if (count($uploaded_images) > 1) {
-                for ($i = 1; $i < count($uploaded_images); $i++) {
-                    $content .= '<figure class="wp-block-image size-large"><img src="' . esc_url($uploaded_images[$i]['url']) . '" alt="' . esc_attr($news['title']) . '"/></figure>';
-                }
-            }
-
-            $related_html = !empty($cat_ids) ? $this->get_related_posts_html($cat_ids[0]) : '';
-            if ($related_html) {
-                $content .= $related_html;
-            }
-
-            $tags = $news['tags'] ?? ['kstnews24'];
-            if (!in_array('kstnews24', $tags, true)) {
-                $tags[] = 'kstnews24';
-            }
-            $content .= '<hr/><p><strong>ট্যাগসমূহ:</strong><br/>' . esc_html(implode(', ', $tags)) . '</p>';
-
-            $post_id = wp_insert_post([
-                'post_title'    => wp_strip_all_tags($news['title']),
-                'post_name'     => sanitize_title($news['englishSlug'] ?? $news['title']),
-                'post_excerpt'  => sanitize_text_field($news['metaDescription'] ?? ''),
-                'post_content'  => $content,
-                'post_status'   => $status,
-                'post_category' => $cat_ids,
-                'tags_input'    => $tags,
-            ]);
-
-            if ($post_id && !is_wp_error($post_id)) {
-                if ($featured_id) {
-                    set_post_thumbnail($post_id, $featured_id);
-                }
-
-                update_option($this->state_key, max($last_id, $msg_id));
-
-                $permalink = get_permalink($post_id);
-                $this->add_log($msg_id, 'Published', '<a href="' . esc_url($permalink) . '" target="_blank">' . esc_html($news['title']) . '</a>');
-                $published_posts[] = [
-                    'id'    => $post_id,
-                    'title' => $news['title'],
-                    'link'  => $permalink,
-                    'msg'   => $msg_id,
+        $uploaded_images = [];
+        foreach ($tg_post['images'] as $idx => $img_url) {
+            $is_featured = ($idx === 0);
+            $att_id = $this->download_and_resize_image($img_url, $news['title'], $is_featured);
+            if ($att_id) {
+                $uploaded_images[] = [
+                    'id'  => $att_id,
+                    'url' => wp_get_attachment_url($att_id),
                 ];
             }
+        }
+
+        $featured_id = !empty($uploaded_images)
+            ? $uploaded_images[0]['id']
+            : $this->generate_fallback_banner($news['title']);
+
+        $cat_ids = [];
+        foreach (($news['categories'] ?? ['জাতীয়']) as $cat_name) {
+            $term = term_exists($cat_name, 'category');
+            if (!$term) {
+                $term = wp_insert_term($cat_name, 'category');
+            }
+            if (!is_wp_error($term)) {
+                $cat_ids[] = (int) $term['term_id'];
+            }
+        }
+
+        $content = '<p><strong>ক্যাটাগরি:</strong> ' . esc_html(implode(' / ', $news['categories'] ?? ['জাতীয়'])) . '</p>';
+        $content .= '<h3><strong>বিস্তারিত সংবাদ:</strong></h3>';
+        $content .= $news['articleHtml'];
+
+        if (!empty($tg_post['video'])) {
+            $content .= '<figure class="wp-block-video"><video controls src="' . esc_url($tg_post['video']) . '" style="max-width:100%;height:auto;"></video></figure>';
+        }
+
+        if (count($uploaded_images) > 1) {
+            for ($i = 1; $i < count($uploaded_images); $i++) {
+                $content .= '<figure class="wp-block-image size-large"><img src="' . esc_url($uploaded_images[$i]['url']) . '" alt="' . esc_attr($news['title']) . '"/></figure>';
+            }
+        }
+
+        $related_html = !empty($cat_ids) ? $this->get_related_posts_html($cat_ids[0]) : '';
+        if ($related_html) {
+            $content .= $related_html;
+        }
+
+        $tags = $news['tags'] ?? ['kstnews24'];
+        if (!in_array('kstnews24', $tags, true)) {
+            $tags[] = 'kstnews24';
+        }
+        $content .= '<hr/><p><strong>ট্যাগসমূহ:</strong><br/>' . esc_html(implode(', ', $tags)) . '</p>';
+
+        $post_id = wp_insert_post([
+            'post_title'     => wp_strip_all_tags($news['title']),
+            'post_name'      => sanitize_title($news['englishSlug'] ?? $news['title']),
+            'post_excerpt'   => sanitize_text_field($news['metaDescription'] ?? ''),
+            'post_content'   => $content,
+            'post_status'    => $status,
+            'post_category'  => $cat_ids,
+            'tags_input'     => $tags,
+            'ping_status'    => 'closed',
+            'comment_status' => 'closed',
+        ]);
+
+        if ($post_id && !is_wp_error($post_id)) {
+            if ($featured_id) {
+                set_post_thumbnail($post_id, $featured_id);
+            }
+
+            update_post_meta($post_id, '_kst_telegram_msg_id', $msg_id);
+            update_option($this->state_key, max($last_id, $msg_id));
+
+            $permalink = get_permalink($post_id);
+            $this->add_log($msg_id, 'Published', '<a href="' . esc_url($permalink) . '" target="_blank">' . esc_html($news['title']) . '</a>');
+            $published_posts[] = [
+                'id'    => $post_id,
+                'title' => $news['title'],
+                'link'  => $permalink,
+                'msg'   => $msg_id,
+            ];
         }
 
         return [
@@ -1030,6 +1106,13 @@ class KSTNews_AI_AutoPilot {
                             resultBox.innerHTML = `<strong>Headline:</strong> ${p.title}<br/><a href="${p.link}" target="_blank" style="display:inline-block; margin-top:8px; color:#2563eb; font-weight:600;">View Published Draft &rarr;</a>`;
                             resultBox.style.display = 'block';
                         }
+                    } else if (data.success && data.data.status === 'info') {
+                        currentPct = 100;
+                        bar.style.width = '100%';
+                        pctLabel.innerText = '100%';
+                        bar.style.background = '#3b82f6';
+                        title.innerText = 'All Caught Up!';
+                        desc.innerText = data.data.message;
                     } else {
                         bar.style.background = '#ef4444';
                         title.innerText = 'Pipeline Stopped';
